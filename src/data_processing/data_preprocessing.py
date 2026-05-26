@@ -1,124 +1,155 @@
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import StandardScaler, MinMaxScaler, QuantileTransformer
-
+from sklearn.preprocessing import (
+    StandardScaler, 
+    MinMaxScaler, 
+    RobustScaler, 
+    QuantileTransformer
+)
 
 class TabularDataPreprocessor:
     def __init__(
         self, 
         continuous_cols: list, 
         categorical_cols: list,
-        scaling_method: str = "minmax",       # Options: "minmax", "standard", "quantile", None
-        clip_outliers: bool = True,           # Toggle Quantile Clipping (Winsorization)
-        lower_quantile: float = 0.01,         # Lower outlier limit boundary
-        upper_quantile: float = 0.99,         # Upper outlier limit boundary
-        categorical_format: str = "one_hot"   # Options: "one_hot", "ordinal"
+        continuous_scaler: str = "standard",   # "standard", "minmax", "robust", "quantile_normal", "quantile_uniform"
+        categorical_encoding: str = "one_hot", # "one_hot", "ordinal"
+        clip_outliers: bool = True,            # Applies Winsorization (1st-99th percentile capping)
+        impute_missing: bool = True            # Automatically handles NaNs
     ):
         """
-        A comprehensive, modular preprocessor engine designed to handle mixed-type 
-        tabular datasets for deep generative networks.
+        A highly configurable preprocessing engine for mixed-type tabular datasets,
+        specifically optimized for probabilistic generative models like VAEs.
         """
         self.continuous_cols = continuous_cols
         self.categorical_cols = categorical_cols
-        self.scaling_method = scaling_method
+        self.continuous_scaler = continuous_scaler
+        self.categorical_encoding = categorical_encoding
         self.clip_outliers = clip_outliers
-        self.lower_quantile = lower_quantile
-        self.upper_quantile = upper_quantile
-        self.categorical_format = categorical_format
+        self.impute_missing = impute_missing
         
-        # Dictionary to lock clipping thresholds determined on the training data
-        self.clipping_bounds = {}
-        
-        # Map structural dictionary elements for categorical decoding tracks
-        self.categories_per_col = {}
-        self.cardinalities = []
-        
-        # Configure the chosen continuous scaler engine
-        if self.scaling_method == "minmax":
-            self.scaler = MinMaxScaler(feature_range=(-1, 1))
-        elif self.scaling_method == "standard":
+        # 1. Initialize Continuous Scaler
+        if self.continuous_scaler == "standard":
             self.scaler = StandardScaler()
-        elif self.scaling_method == "quantile":
-            # Maps arbitrary shapes directly to a uniform distribution between -1 and 1
-            self.scaler = QuantileTransformer(n_quantiles=1000, output_distribution='uniform')
+        elif self.continuous_scaler == "robust":
+            # Uses median and IQR; heavily resistant to severe outliers
+            self.scaler = RobustScaler()
+        elif self.continuous_scaler == "minmax":
+            self.scaler = MinMaxScaler(feature_range=(-1, 1))
+        elif self.continuous_scaler == "quantile_normal":
+            # Forces arbitrary distributions into a smooth Gaussian bell curve
+            self.scaler = QuantileTransformer(output_distribution='normal', random_state=42)
+        elif self.continuous_scaler == "quantile_uniform":
+            self.scaler = QuantileTransformer(output_distribution='uniform', random_state=42)
         else:
             self.scaler = None
 
+        # Metadata tracking for inverse transformations and neural network dimension sizing
+        self.clipping_bounds = {}
+        self.imputation_values = {}
+        self.categories_per_col = {}
+        self.cardinalities = []
+
     def fit(self, df: pd.DataFrame):
-        """
-        Learns statistical parameters, outlier clipping limits, and categorical class structures.
-        """
-        # 1. Process continuous data distributions
+        """Learns statistical parameters, clipping boundaries, and categorical structures."""
+        
+        # --- Continuous Features ---
         if self.continuous_cols:
-            df_cont = df[self.continuous_cols].fillna(0.0).copy()
+            df_cont = df[self.continuous_cols].copy()
             
-            # Learn and execute clipping limits if enabled
+            # Learn imputation values (Mean)
+            if self.impute_missing:
+                for col in self.continuous_cols:
+                    self.imputation_values[col] = df_cont[col].mean()
+                    df_cont[col] = df_cont[col].fillna(self.imputation_values[col])
+            else:
+                df_cont = df_cont.fillna(0.0)
+
+            # Learn clipping bounds (1st and 99th percentiles)
             if self.clip_outliers:
                 for col in self.continuous_cols:
-                    lower_bound = df_cont[col].quantile(self.lower_quantile)
-                    upper_bound = df_cont[col].quantile(self.upper_quantile)
-                    self.clipping_bounds[col] = (lower_bound, upper_bound)
-                    df_cont[col] = df_cont[col].clip(lower_bound, upper_bound)
-            
-            # Fit the configured scaling algorithm
+                    lower = df_cont[col].quantile(0.01)
+                    upper = df_cont[col].quantile(0.99)
+                    self.clipping_bounds[col] = (lower, upper)
+                    df_cont[col] = df_cont[col].clip(lower, upper)
+                    
             if self.scaler is not None:
                 self.scaler.fit(df_cont)
 
-        # 2. Map categorical features and cache structural sizing
+        # --- Categorical Features ---
         self.categories_per_col = {}
         self.cardinalities = []
+        
         for col in self.categorical_cols:
-            unique_cats = sorted(df[col].dropna().unique().tolist())
+            col_data = df[col].copy()
+            
+            # Learn imputation values (Mode/Most Frequent)
+            if self.impute_missing:
+                mode_val = col_data.mode()[0] if not col_data.mode().empty else "Missing"
+                self.imputation_values[col] = mode_val
+                col_data = col_data.fillna(mode_val)
+            
+            # Track unique categories sequentially
+            unique_cats = sorted(col_data.dropna().unique().tolist())
             self.categories_per_col[col] = unique_cats
             self.cardinalities.append(len(unique_cats))
             
         return self
 
     def transform(self, df: pd.DataFrame) -> np.ndarray:
-        """
-        Transforms an incoming mixed-type DataFrame into a single numerical matrix layout 
-        based on your designated continuous and categorical scaling options.
-        """
+        """Transforms a DataFrame into a combined numerical matrix."""
         processed_blocks = []
         
-        # 1. Continuous transformation pipeline
+        # --- Continuous Features ---
         if self.continuous_cols:
-            df_cont = df[self.continuous_cols].fillna(0.0).copy()
+            df_cont = df[self.continuous_cols].copy()
             
+            if self.impute_missing:
+                for col in self.continuous_cols:
+                    df_cont[col] = df_cont[col].fillna(self.imputation_values[col])
+            else:
+                df_cont = df_cont.fillna(0.0)
+                
             if self.clip_outliers:
                 for col in self.continuous_cols:
-                    lower_bound, upper_bound = self.clipping_bounds[col]
-                    df_cont[col] = df_cont[col].clip(lower_bound, upper_bound)
+                    lower, upper = self.clipping_bounds[col]
+                    df_cont[col] = df_cont[col].clip(lower, upper)
                     
             if self.scaler is not None:
-                scaled_continuous = self.scaler.transform(df_cont)
-                # If using QuantileTransformer, scale from [0, 1] to [-1, 1] manually
-                if self.scaling_method == "quantile":
-                    scaled_continuous = (scaled_continuous * 2.0) - 1.0
+                scaled_cont = self.scaler.transform(df_cont)
             else:
-                scaled_continuous = df_cont.values
+                scaled_cont = df_cont.values
                 
-            processed_blocks.append(scaled_continuous)
+            processed_blocks.append(scaled_cont)
 
-        # 2. Categorical processing pipeline
+        # --- Categorical Features ---
         for col in self.categorical_cols:
-            fallback_val = self.categories_per_col[col][0]
-            col_data = df[col].fillna(fallback_val).values
+            col_data = df[col].copy()
             
-            if self.categorical_format == "one_hot":
-                num_categories = len(self.categories_per_col[col])
-                one_hot = np.zeros((len(df), num_categories))
-                for idx, val in enumerate(col_data):
+            if self.impute_missing:
+                col_data = col_data.fillna(self.imputation_values[col])
+            else:
+                fallback = self.categories_per_col[col][0]
+                col_data = col_data.fillna(fallback)
+                
+            vals = col_data.values
+            num_cats = len(self.categories_per_col[col])
+            
+            if self.categorical_encoding == "one_hot":
+                # Create hard binary matrices (best for VAE categorical cross-entropy loss)
+                one_hot = np.zeros((len(df), num_cats))
+                for idx, val in enumerate(vals):
                     cat_idx = self.categories_per_col[col].index(val) if val in self.categories_per_col[col] else 0
                     one_hot[idx, cat_idx] = 1.0
                 processed_blocks.append(one_hot)
                 
-            elif self.categorical_format == "ordinal":
-                cat_codes = np.array([
+            elif self.categorical_encoding == "ordinal":
+                # Create a single column of integer codes
+                codes = np.array([
                     self.categories_per_col[col].index(val) if val in self.categories_per_col[col] else 0
-                    for val in col_data
+                    for val in vals
                 ], dtype=float).reshape(-1, 1)
-                processed_blocks.append(cat_codes)
+                processed_blocks.append(codes)
                 
         return np.hstack(processed_blocks) if processed_blocks else np.empty((len(df), 0))
 
