@@ -84,8 +84,8 @@ def evaluate_generator_performance(real_df: pd.DataFrame, synthetic_df: pd.DataF
         
         # Align indexes to ensure identical structural dimensions
         all_categories = p_r.index.union(p_s.index)
-        p_r = p_r.reindex(all_categories, fillvalue=0.0).values
-        p_s = p_s.reindex(all_categories, fillvalue=0.0).values
+        p_r = p_r.reindex(all_categories, fill_value=0.0).values
+        p_s = p_s.reindex(all_categories, fill_value=0.0).values
         
         # Equation 3 calculation
         tvd = 0.5 * np.sum(np.abs(p_r - p_s))

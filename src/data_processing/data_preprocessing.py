@@ -14,7 +14,7 @@ class TabularDataPreprocessor:
         categorical_cols: list,
         continuous_scaler: str = "standard",   # "standard", "minmax", "robust", "quantile_normal", "quantile_uniform"
         categorical_encoding: str = "one_hot", # "one_hot", "ordinal"
-        clip_outliers: bool = True,            # Applies Winsorization (1st-99th percentile capping)
+        clip_outliers: bool = False,            # Applies Winsorization (1st-99th percentile capping)
         impute_missing: bool = True            # Automatically handles NaNs
     ):
         """
@@ -57,7 +57,7 @@ class TabularDataPreprocessor:
         if self.continuous_cols:
             df_cont = df[self.continuous_cols].copy()
             
-            # Learn imputation values (Mean)
+            # Impute by mean
             if self.impute_missing:
                 for col in self.continuous_cols:
                     self.imputation_values[col] = df_cont[col].mean()
@@ -83,7 +83,7 @@ class TabularDataPreprocessor:
         for col in self.categorical_cols:
             col_data = df[col].copy()
             
-            # Learn imputation values (Mode/Most Frequent)
+            # Impute by mode
             if self.impute_missing:
                 mode_val = col_data.mode()[0] if not col_data.mode().empty else "Missing"
                 self.imputation_values[col] = mode_val
