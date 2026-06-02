@@ -3,6 +3,7 @@ import torch
 import pandas as pd
 import mlflow
 import matplotlib.pyplot as plt
+import math
 from sklearn.model_selection import train_test_split
 import mlflow.pytorch
 from torch.utils.data import DataLoader, TensorDataset
@@ -13,7 +14,7 @@ from src.models.vae import MixedTabularVAE
 from src.utils.loss import TabVAELoss
 from src.Evaluations.eval_metrics import evaluate_generator_performance
 
-def train_vae(data_path: str, epochs: int=500, batch_size: int=256, latent_dim: int= 64, mmd_weight: float=1000.0, lr: float=1e-3, val_split: float=0.2):
+def train_vae(data_path: str, epochs: int=500, batch_size: int=256, latent_dim: int= 32, mmd_weight: float=500.0, lr: float=1e-3, val_split: float=0.2):
     device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
     print(f"Training engine initialised on device: {device}")
     print(f"Raw Tabular data loaded from {data_path}")
@@ -45,6 +46,8 @@ def train_vae(data_path: str, epochs: int=500, batch_size: int=256, latent_dim: 
     mlflow.set_experiment("Mixed_Tabular_VAE_Synthesis")
     history= {"train_loss": [], "val_loss": [], "train_recon" : [], "val_recon" : [], "train_mmd" :[], "val_mmd" :[], "tau": []}
     weight_path = "best_vae_weights.pt"
+    tau_min=0.1
+    tau_max=1.0
     with mlflow.start_run(run_name=f"VAE_latent{latent_dim}_epochs{epochs}"):
         mlflow.log_params({"epochs": epochs, "batch_size": batch_size, "latent_dim": latent_dim,
             "train_size": len(train_df), "val_size": len(val_df), "test_size": len(test_df)})
@@ -52,12 +55,15 @@ def train_vae(data_path: str, epochs: int=500, batch_size: int=256, latent_dim: 
         criterion=TabVAELoss(continuous_dim,cardinalities,mmd_weight)
         optimizer= torch.optim.AdamW(model.parameters(),lr=lr, weight_decay=1e-4)
         best_val_loss=float('inf')
+        patience=50
+        patience_counter=0
         if True:
             print("Starting Optimization:") # helps identify the starting of the loop for debugging
             for epoch in range(1,epochs+1):
                 model.train()
                 train_loss, train_recon,mmd_loss= 0.0, 0.0, 0.0
-                current_tau= max(0.1, 1.0-(epoch/epochs)*0.9) # baseline tau=0.1
+                cos_inner = math.pi * (epoch - 1) / epochs
+                current_tau = tau_min + 0.5 * (tau_max - tau_min) * (1.0 + math.cos(cos_inner))
                 model.decoder.tau= current_tau
                 history["tau"].append(current_tau)
                 
@@ -104,16 +110,18 @@ def train_vae(data_path: str, epochs: int=500, batch_size: int=256, latent_dim: 
                 if avg_val_loss<best_val_loss:
                     best_val_loss=avg_val_loss
                     torch.save(model.state_dict(),weight_path)
+                    patience_counter = 0
+                else:
+                    patience_counter+=1
 
                 mlflow.log_metrics({"train_loss": avg_train_loss, "val_loss": avg_val_loss}, step=epoch)
-                if epoch % 10 == 0 or epoch == 1:
+                if epoch % 50 == 0 or epoch == 1:
                     print(f"Epoch [{epoch:03d}/{epochs}] | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | MMD Loss: {avg_train_mmd}")
-
             print("Loss Curves:")
             fig = plt.figure(figsize=(18, 5))
             plt.subplot(1, 3, 1)
-            plt.plot(range(1, epochs + 1), history["train_loss"], label="Train Total Loss", color='blue')
-            plt.plot(range(1, epochs + 1), history["val_loss"], label="Validation Total Loss", color='orange')
+            plt.plot(range(1, len(history["train_loss"]) + 1), history["train_loss"], label="Train Total Loss", color='blue')
+            plt.plot(range(1, len(history["train_loss"]) + 1), history["val_loss"], label="Validation Total Loss", color='orange')
             plt.title("Total Objective Loss")
             plt.xlabel("Epochs")
             plt.ylabel("Loss")
@@ -121,16 +129,16 @@ def train_vae(data_path: str, epochs: int=500, batch_size: int=256, latent_dim: 
             plt.grid(True, linestyle='--', alpha=0.7)
 
             plt.subplot(1, 3, 2)
-            plt.plot(range(1, epochs + 1), history["train_recon"], label="Train Recon Loss", color='green')
-            plt.plot(range(1, epochs + 1), history["val_recon"], label="Validation Recon Loss", color='red')
+            plt.plot(range(1, len(history["train_loss"]) + 1), history["train_recon"], label="Train Recon Loss", color='green')
+            plt.plot(range(1, len(history["train_loss"]) + 1), history["val_recon"], label="Validation Recon Loss", color='red')
             plt.title("Reconstruction Accuracy")
             plt.xlabel("Epochs")
             plt.legend()
             plt.grid(True, linestyle='--', alpha=0.7)
 
             ax1 = plt.subplot(1, 3, 3) 
-            p1, = ax1.plot(range(1, epochs + 1), history["train_mmd"], label="Train MMD Loss", color='purple')
-            p2, = ax1.plot(range(1, epochs + 1), history["val_mmd"], label="Validation MMD Loss", color='brown')
+            p1, = ax1.plot(range(1, len(history["train_loss"]) + 1), history["train_mmd"], label="Train MMD Loss", color='purple')
+            p2, = ax1.plot(range(1, len(history["train_loss"]) + 1), history["val_mmd"], label="Validation MMD Loss", color='brown')
             ax1.set_title("Latent Alignment & Tau Decay")
             ax1.set_xlabel("Epochs")
             ax1.set_ylabel("MMD Loss", color='purple')
@@ -138,7 +146,7 @@ def train_vae(data_path: str, epochs: int=500, batch_size: int=256, latent_dim: 
             ax1.grid(True, linestyle='--', alpha=0.7)
 
             ax2 = ax1.twinx()  
-            p3, = ax2.plot(range(1, epochs + 1), history["tau"], label="Tau Temperature", color='darkgray', linestyle=':')
+            p3, = ax2.plot(range(1, len(history["train_loss"]) + 1), history["tau"], label="Tau Temperature", color='darkgray', linestyle=':')
             ax2.set_ylabel("Tau (Temperature)", color='black')
             ax2.tick_params(axis='y', labelcolor='black')
 
@@ -188,7 +196,7 @@ def train_vae(data_path: str, epochs: int=500, batch_size: int=256, latent_dim: 
 if __name__ == "__main__":
     target_data = "/Users/arnabchakraborti/tabular/tabular_generation_project/data/adult/adult.data" 
     if os.path.exists(target_data):
-        train_vae(data_path=target_data, epochs=100)
+        train_vae(data_path=target_data, epochs=1000)
     else:
         print(f"Error: Could not find '{target_data}'.")
 

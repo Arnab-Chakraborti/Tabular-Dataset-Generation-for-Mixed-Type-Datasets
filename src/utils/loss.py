@@ -41,7 +41,7 @@ class TabVAELoss(nn.Module):
             pred_cont=recon_x[:, :self.continuous_dim]
             true_cont=target_x[:, :self.continuous_dim]
 
-            recon_loss+= F.mse_loss(pred_cont, true_cont, reduction='mean')
+            recon_loss+=F.mse_loss(pred_cont, true_cont, reduction='mean')
         current_idx= self.continuous_dim
         for card in self.cardinalities:
             pred_cat=recon_x[:, current_idx : current_idx + card]

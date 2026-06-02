@@ -1,0 +1,23 @@
+artifact_path: /Users/arnabchakraborti/tabular/tabular_generation_project/mlruns/1/models/m-e91aa0cc0afc40af8353f94cf5f3ec37/artifacts
+flavors:
+  python_function:
+    config:
+      device: null
+    data: data
+    env:
+      conda: conda.yaml
+      virtualenv: python_env.yaml
+    loader_module: mlflow.pytorch
+    pickle_module_name: mlflow.pytorch.pickle_module
+    python_version: 3.13.7
+  pytorch:
+    code: null
+    model_data: data
+    pytorch_version: 2.12.0
+mlflow_version: 3.12.0
+model_id: m-e91aa0cc0afc40af8353f94cf5f3ec37
+model_size_bytes: 620585
+model_uuid: m-e91aa0cc0afc40af8353f94cf5f3ec37
+prompts: null
+run_id: 9d167dd7141a4e4095fa7918bcf4554a
+utc_time_created: '2026-06-02 08:19:28.246002'
