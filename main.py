@@ -1,231 +1,273 @@
-import os
 import torch
+import torch.optim as optim
 import pandas as pd
-import mlflow
-import matplotlib.pyplot as plt
-import math
+import numpy as np
+import os
+from torch.utils.data import DataLoader, Dataset
 from sklearn.model_selection import train_test_split
-import mlflow.pytorch
-from torch.utils.data import DataLoader, TensorDataset
-from src.models.vae import MixedTabularVAE
+
+from src.models.tabSyn import TabSynVAE
+from src.models.tabSyn_diffusion import TabSynDenoisingMLP
+from src.utils.loss import TabSynLossEngine, compute_diffusion_loss
 from src.data_processing.data_preprocessing import TabularDataPreprocessor
 from src.data_processing.data_postprocessing import TabularDataPostprocessor
-from src.models.vae import MixedTabularVAE
-from src.utils.loss import TabVAELoss
 from src.Evaluations.eval_metrics import evaluate_generator_performance
 
-def train_vae(data_path: str, epochs: int=500, batch_size: int=256, latent_dim: int= 32, mmd_weight: float=500.0, lr: float=1e-3, val_split: float=0.2):
-    device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-    print(f"Training engine initialised on device: {device}")
-    print(f"Raw Tabular data loaded from {data_path}")
-    raw_df = pd.read_csv(data_path)
-    train_df, temp_df= train_test_split(raw_df, test_size= val_split, shuffle= True, random_state=42)
-    val_df, test_df= train_test_split(temp_df, test_size= 0.50, shuffle= True, random_state=42)
 
-    print(f"Split: {len(train_df)} Train | {len(val_df)} Val | {len(test_df)} Test")
-    continuous_cols=raw_df.select_dtypes(include=['float64','int64']).columns.tolist()
-    categorical_cols=raw_df.select_dtypes(include=['object','category','bool']).columns.tolist()
+DATA_PATH = os.path.join(os.path.dirname(__file__), 'data', 'adult', 'adult.data')
+
+
+# -------------------------
+# Dataset
+# -------------------------
+class TabularDataset(Dataset):
+    def __init__(self, data_matrix, num_dim, cat_dims):
+        self.data = torch.tensor(data_matrix, dtype=torch.float32)
+        self.num_dim = num_dim
+        self.cat_dims = cat_dims
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        row = self.data[idx]
+        x_num = row[:self.num_dim]
+
+        ohe_list = []
+        labels = []
+        start = self.num_dim
+
+        for dim in self.cat_dims:
+            ohe = row[start:start + dim]
+            ohe_list.append(ohe)
+            labels.append(torch.argmax(ohe))
+            start += dim
+
+        return x_num, ohe_list, torch.tensor(labels, dtype=torch.long)
+
+
+def collate_fn(batch):
+    x_nums = torch.stack([b[0] for b in batch])
+
+    x_cat_ohes = []
+    if len(batch[0][1]) > 0:
+        for i in range(len(batch[0][1])):
+            x_cat_ohes.append(torch.stack([b[1][i] for b in batch]))
+
+    x_labels = torch.stack([b[2] for b in batch])
+    return x_nums, x_cat_ohes, x_labels
+
+
+# -------------------------
+# Helpers
+# -------------------------
+def auto_detect_columns(df):
+    cont = df.select_dtypes(include=[np.number]).columns.tolist()
+    cat = df.select_dtypes(exclude=[np.number]).columns.tolist()
+    return cont, cat
+
+
+# -------------------------
+# Main
+# -------------------------
+def main():
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Using:", device)
+
+    torch.backends.cudnn.benchmark = True
+
+    scaler = torch.amp.GradScaler()
+
+    # -------------------------
+    # Data
+    # -------------------------
+    df = pd.read_csv(DATA_PATH)
+    cont_cols, cat_cols = auto_detect_columns(df)
+
+    train_df, test_df = train_test_split(df, test_size=0.3, random_state=42)
+
     preprocessor = TabularDataPreprocessor(
-        continuous_cols=continuous_cols, 
-        categorical_cols=categorical_cols,
-        continuous_scaler="standard",  
-        clip_outliers=False,        
-        impute_missing=True
+        continuous_cols=cont_cols,
+        categorical_cols=cat_cols
     )
-    train_matrix= preprocessor.fit_transform(train_df)
-    val_matrix = preprocessor.transform(val_df)
-    test_matrix= preprocessor.transform(test_df)  
 
-    cardinalities= preprocessor.cardinalities
-    input_dim = train_matrix.shape[1]
-    continuous_dim=len(continuous_cols)
-    train_loader= DataLoader(TensorDataset(torch.tensor(train_matrix, dtype= torch.float32)), batch_size=batch_size, shuffle= True)
-    val_loader = DataLoader(TensorDataset(torch.tensor(val_matrix, dtype=torch.float32)), batch_size=batch_size * 2, shuffle=False)
-    test_loader = DataLoader(TensorDataset(torch.tensor(test_matrix, dtype=torch.float32)), batch_size=batch_size * 2, shuffle=False)
+    processed = preprocessor.fit_transform(train_df)
 
-    mlflow.set_experiment("Mixed_Tabular_VAE_Synthesis")
-    history= {"train_loss": [], "val_loss": [], "train_recon" : [], "val_recon" : [], "train_mmd" :[], "val_mmd" :[], "tau": []}
-    weight_path = "best_vae_weights.pt"
-    tau_min=0.1
-    tau_max=1.0
-    with mlflow.start_run(run_name=f"VAE_latent{latent_dim}_epochs{epochs}"):
-        mlflow.log_params({"epochs": epochs, "batch_size": batch_size, "latent_dim": latent_dim,
-            "train_size": len(train_df), "val_size": len(val_df), "test_size": len(test_df)})
-        model = MixedTabularVAE(input_dim, continuous_dim, cardinalities, [256, 128, 64], latent_dim).to(device)
-        criterion=TabVAELoss(continuous_dim,cardinalities,mmd_weight)
-        optimizer= torch.optim.AdamW(model.parameters(),lr=lr, weight_decay=1e-4)
-        best_val_loss=float('inf')
-        patience=50
-        patience_counter=0
-        if True:
-            print("Starting Optimization:") # helps identify the starting of the loop for debugging
-            for epoch in range(1,epochs+1):
-                model.train()
-                train_loss, train_recon,mmd_loss= 0.0, 0.0, 0.0
-                cos_inner = math.pi * (epoch - 1) / epochs
-                current_tau = tau_min + 0.5 * (tau_max - tau_min) * (1.0 + math.cos(cos_inner))
-                model.decoder.tau= current_tau
-                history["tau"].append(current_tau)
-                
+    num_numeric = len(preprocessor.continuous_cols)
+    cat_cardinalities = preprocessor.cardinalities
+    num_columns = num_numeric + len(cat_cardinalities)
 
-                for (batch_x,) in train_loader:
-                    batch_x= batch_x.to(device)
-                    recon_x,z= model.forward(batch_x)
-                    loss,recon_loss,train_mmd=criterion(recon_x,batch_x,z)
+    dataset = TabularDataset(processed, num_numeric, cat_cardinalities)
 
-                    optimizer.zero_grad()
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    optimizer.step()
-                    train_loss+=loss.item()
-                    train_recon+=recon_loss.item()
-                    mmd_loss+=train_mmd.item()
+    train_loader = DataLoader(
+        dataset,
+        batch_size=1024,   # reduced from 4096 (important for stability)
+        shuffle=True,
+        collate_fn=collate_fn,
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=4
+    )
 
-                avg_train_loss =train_loss/len(train_loader)
-                avg_train_recon= train_recon/len(train_loader)
-                avg_train_mmd=mmd_loss/len(train_loader)
+    # -------------------------
+    # VAE
+    # -------------------------
+    d_token = 4
 
-                # Validation
+    vae = TabSynVAE(
+        num_numeric=num_numeric,
+        cat_cardinalities=cat_cardinalities,
+        d_token=d_token
+    ).to(device)
 
-                model.eval()
-                val_loss, val_recon,val_mmd=0.0, 0.0, 0.0
-                with torch.no_grad():
-                    for (batch_x,) in val_loader:
-                        batch_x = batch_x.to(device)
-                        recon_x,z = model.forward(batch_x)
-                        loss, recon_loss, mmd_loss=criterion(recon_x,batch_x,z)
-                        val_loss+=loss.item()
-                        val_recon+=recon_loss.item()
-                        val_mmd+=mmd_loss.item()
-                avg_val_loss = val_loss/len(val_loader)
-                avg_val_recon = val_recon/len(val_loader)
-                avg_val_mmd = val_mmd/len(val_loader)
-                history["train_loss"].append(avg_train_loss)
-                history["val_loss"].append(avg_val_loss)
-                history["train_recon"].append(avg_train_recon)
-                history["val_recon"].append(avg_val_recon)
-                history["train_mmd"].append(avg_train_mmd)
-                history["val_mmd"].append(avg_val_mmd)
+    vae = torch.compile(vae)
 
-                if avg_val_loss<best_val_loss:
-                    best_val_loss=avg_val_loss
-                    torch.save(model.state_dict(),weight_path)
-                    patience_counter = 0
-                else:
-                    patience_counter+=1
+    vae_optimizer = optim.Adam(vae.parameters(), lr=1e-3, weight_decay=1e-5)
+    loss_engine = TabSynLossEngine(beta_max=0.01, beta_min=1e-5, lambda_decay=0.7, patience=5)
 
-                mlflow.log_metrics({"train_loss": avg_train_loss, "val_loss": avg_val_loss}, step=epoch)
-                if epoch % 50 == 0 or epoch == 1:
-                    print(f"Epoch [{epoch:03d}/{epochs}] | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | MMD Loss: {avg_train_mmd}")
-            print("Loss Curves:")
-            fig = plt.figure(figsize=(18, 5))
-            plt.subplot(1, 3, 1)
-            plt.plot(range(1, len(history["train_loss"]) + 1), history["train_loss"], label="Train Total Loss", color='blue')
-            plt.plot(range(1, len(history["train_loss"]) + 1), history["val_loss"], label="Validation Total Loss", color='orange')
-            plt.title("Total Objective Loss")
-            plt.xlabel("Epochs")
-            plt.ylabel("Loss")
-            plt.legend()
-            plt.grid(True, linestyle='--', alpha=0.7)
+    # -------------------------
+    # TRAIN VAE (AMP)
+    # -------------------------
+    vae_epochs = 200
 
-            plt.subplot(1, 3, 2)
-            plt.plot(range(1, len(history["train_loss"]) + 1), history["train_recon"], label="Train Recon Loss", color='green')
-            plt.plot(range(1, len(history["train_loss"]) + 1), history["val_recon"], label="Validation Recon Loss", color='red')
-            plt.title("Reconstruction Accuracy")
-            plt.xlabel("Epochs")
-            plt.legend()
-            plt.grid(True, linestyle='--', alpha=0.7)
+    vae.train()
+    for epoch in range(vae_epochs):
+        total_loss = 0
 
-            ax1 = plt.subplot(1, 3, 3) 
-            p1, = ax1.plot(range(1, len(history["train_loss"]) + 1), history["train_mmd"], label="Train MMD Loss", color='purple')
-            p2, = ax1.plot(range(1, len(history["train_loss"]) + 1), history["val_mmd"], label="Validation MMD Loss", color='brown')
-            ax1.set_title("Latent Alignment & Tau Decay")
-            ax1.set_xlabel("Epochs")
-            ax1.set_ylabel("MMD Loss", color='purple')
-            ax1.tick_params(axis='y', labelcolor='purple')
-            ax1.grid(True, linestyle='--', alpha=0.7)
+        for x_num, x_cat_ohes, x_labels in train_loader:
+            x_num = x_num.to(device, non_blocking=True)
+            x_cat_ohes = [c.to(device, non_blocking=True) for c in x_cat_ohes]
+            x_labels = x_labels.to(device, non_blocking=True)
 
-            ax2 = ax1.twinx()  
-            p3, = ax2.plot(range(1, len(history["train_loss"]) + 1), history["tau"], label="Tau Temperature", color='darkgray', linestyle=':')
-            ax2.set_ylabel("Tau (Temperature)", color='black')
-            ax2.tick_params(axis='y', labelcolor='black')
+            vae_optimizer.zero_grad()
 
-            lines = [p1, p2, p3]
-            ax1.legend(lines, [l.get_label() for l in lines], loc='upper right')
-            
-            plt.grid(True, linestyle='--', alpha=0.7)
+            with torch.amp.autocast(device_type="cuda"):
+                mu, logvar = vae.encode(x_num, None, x_cat_ohes)
+                z = vae.reparameterize(mu, logvar)
+                x_num_hat, x_cat_hat = vae.decode(z)
 
-            os.makedirs("data/plots", exist_ok=True)
-            plot_path = "data/plots/loss_curves.png"
-            plt.tight_layout()
-            plt.savefig(plot_path)
-            plt.close(fig)
-            mlflow.log_artifact(plot_path, artifact_path="plots")
+                loss, recon, kl = loss_engine.compute_vae_loss(
+                    x_num, x_labels, x_num_hat, x_cat_hat, mu, logvar
+                )
 
-        print("Evaluation against unseen test dataset:")
-        model.load_state_dict(torch.load(weight_path, weights_only=True))
-        model.eval()
-        gen_size=len(test_df)
-        synthetic_raw = model.generate(gen_size,device=device).cpu().numpy()
-        postprocessor=TabularDataPostprocessor(preprocessor)
-        synthetic_df_export = postprocessor.inverse_transform(synthetic_raw)
-        output_path = "data/plots/loss_curves.png"
-        synthetic_df_export.to_csv(output_path, index=False)
-        gen_metrics = evaluate_generator_performance(real_df=test_df,synthetic_df=synthetic_df_export, k=5)
-        
-        print("\n Final Generative Performance (Unseen Data):")
-        print(f"   Shape Error:     {gen_metrics['shape_error_pct']:.2f}%")
-        print(f"   Trend Error:     {gen_metrics['trend_error_pct']:.2f}%")
-        print(f"   Alpha-Precision: {gen_metrics['alpha_precision_pct']:.2f}%")
-        print(f"   Beta-Recall:     {gen_metrics['beta_recall_pct']:.2f}%")
+            scaler.scale(loss).backward()
+            scaler.step(vae_optimizer)
+            scaler.update()
 
-        mlflow.log_metrics({
-                "test_shape_error": gen_metrics["shape_error_pct"],
-                "test_trend_error": gen_metrics["trend_error_pct"],
-                "test_alpha_precision": gen_metrics["alpha_precision_pct"],
-                "test_beta_recall": gen_metrics["beta_recall_pct"]
-            })
-            
-        mlflow.log_artifact(output_path, artifact_path="synthetic_data")
-        mlflow.pytorch.log_model(model, "vae_model")
-        print(f"Pipeline complete.")
+            total_loss += loss.item()
 
-        return model
+        if epoch % 20 == 0:
+            print(f"VAE Epoch {epoch}: {total_loss/len(train_loader):.4f}")
+
+    # -------------------------
+    # Freeze VAE
+    # -------------------------
+    vae.eval()
+    for p in vae.parameters():
+        p.requires_grad = False
+
+    # -------------------------
+    # PRECOMPUTE LATENT SPACE (CRITICAL SPEEDUP)
+    # -------------------------
+    print("Precomputing latent space...")
+
+    Z_list = []
+
+    with torch.no_grad():
+        for x_num, x_cat_ohes, _ in train_loader:
+            x_num = x_num.to(device)
+            x_cat_ohes = [c.to(device) for c in x_cat_ohes]
+
+            mu, logvar = vae.encode(x_num, None, x_cat_ohes)
+            z = vae.reparameterize(mu, logvar)
+
+            Z_list.append(z.flatten(start_dim=1))
+
+    Z_dataset = torch.cat(Z_list, dim=0)
+
+    # -------------------------
+    # DIFFUSION MODEL
+    # -------------------------
+    diffusion_model = TabSynDenoisingMLP(
+        num_columns=num_columns,
+        d_token=d_token
+    ).to(device)
+
+    diffusion_model = torch.compile(diffusion_model)
+
+    diff_optimizer = optim.Adam(diffusion_model.parameters(), lr=1e-3, weight_decay=1e-4)
+
+    diff_epochs = 500
+
+    # -------------------------
+    # DIFFUSION TRAINING (FAST)
+    # -------------------------
+    diffusion_model.train()
+
+    for epoch in range(diff_epochs):
+        perm = torch.randperm(Z_dataset.size(0), device=device)
+        total_loss = 0
+
+        for i in range(0, len(perm), 1024):
+            idx = perm[i:i+1024]
+            z_0 = Z_dataset[idx]
+
+            diff_optimizer.zero_grad()
+
+            with torch.amp.autocast(device_type="cuda"):
+                loss = compute_diffusion_loss(diffusion_model, z_0, t_max=1.0)
+
+            scaler.scale(loss).backward()
+            scaler.step(diff_optimizer)
+            scaler.update()
+
+            total_loss += loss.item()
+
+        if epoch % 20 == 0:
+            print(f"Diff Epoch {epoch}: {total_loss:.4f}")
+
+    # -------------------------
+    # SAMPLING
+    # -------------------------
+    diffusion_model.eval()
+
+    gen_size = len(test_df)
+    flat_dim = num_columns * d_token
+
+    z_t = torch.randn(gen_size, flat_dim, device=device)
+
+    steps = 20
+    dt = 1.0 / steps
+
+    with torch.no_grad(), torch.amp.autocast(device_type="cuda"):
+        for i in range(steps):
+            t = torch.full((gen_size,), 1.0 - i * dt, device=device)
+            eps = diffusion_model(z_t, t)
+            z_t = z_t - eps * dt
+
+        Z_clean = z_t.view(gen_size, num_columns, d_token)
+        synth_num, synth_cat = vae.decode(Z_clean)
+
+    # -------------------------
+    # POSTPROCESS
+    # -------------------------
+    postprocessor = TabularDataPostprocessor(preprocessor)
+
+    synth_num_np = synth_num.cpu().numpy() if synth_num is not None else np.empty((gen_size, 0))
+    synth_cat_np = [x.cpu().numpy() for x in synth_cat]
+
+    raw = np.hstack([synth_num_np] + synth_cat_np) if len(synth_cat_np) else synth_num_np
+
+    synthetic_df = postprocessor.inverse_transform(raw)
+
+    metrics = evaluate_generator_performance(test_df, synthetic_df, k=5)
+
+    print("\nFinal Metrics:")
+    for k, v in metrics.items():
+        print(k, v)
 
 
 if __name__ == "__main__":
-    target_data = "/Users/arnabchakraborti/tabular/tabular_generation_project/data/adult/adult.data" 
-    if os.path.exists(target_data):
-        train_vae(data_path=target_data, epochs=1000)
-    else:
-        print(f"Error: Could not find '{target_data}'.")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-        
-        
+    main()
