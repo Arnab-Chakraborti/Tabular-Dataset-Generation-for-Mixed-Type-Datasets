@@ -1,6 +1,7 @@
 # Python
 __pycache__/
 *.py[cod]
+*.pyo
 
 # Virtual environments
 .venv/
@@ -10,16 +11,16 @@ env/
 # Jupyter
 .ipynb_checkpoints/
 
-# MLflow
-mlruns/
-mlflow.db
-
-# Model weights
+# Model checkpoints
 *.pt
 *.pth
 
-# macOS
-.DS_Store
+# Logs
+*.log
 
-# VS Code
-.vscode/
+# MLFlow
+mlruns/
+mlflow.db
+
+# OS files
+.DS_Store
