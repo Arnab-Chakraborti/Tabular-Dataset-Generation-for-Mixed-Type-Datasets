@@ -11,6 +11,7 @@ class TabularEncoder(nn.Module):
             layers.append(nn.Linear(in_dim,h_dim))
             layers.append(nn.BatchNorm1d(h_dim))
             layers.append(nn.LeakyReLU(0.2))
+            #layers.append(nn.SiLU())
             in_dim=h_dim
         self.encoder_base= nn.Sequential(*layers) #(*layers) implies unpacking [layers] as layer1-->layer2-->....-->layer n
         #bifurcation into mu and sigma
@@ -52,7 +53,7 @@ class TabularDecoder(nn.Module):
             outputs.append(self.continuous_head(hidden))
         for head in self.categorical_head:
             logits=head(hidden)
-            cat_output=F.gumbel_softmax(logits, tau= self.tau, hard=True)
+            cat_output=F.gumbel_softmax(logits, tau= self.tau, hard=False)
             outputs.append(cat_output)
 
         return torch.cat(outputs, dim=1)
@@ -65,7 +66,8 @@ class MixedTabularVAE(nn.Module):#master architecture tying the probabilistic pi
         self.encoder= TabularEncoder(input_dim, hidden_dims, latent_dim)
         self.decoder= TabularDecoder(latent_dim, hidden_dims, continuous_dim, cardinalities, tau)
 
-    def reparameterize(self, mu: torch.Tensor, logvar= torch.Tensor) -> torch.Tensor:
+    def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        #logvar = torch.clamp(logvar, min=-30.0, max=20.0)
         std=torch.exp(0.5 * logvar)
         eps=torch.randn_like(std)
         return mu + eps * std
@@ -74,7 +76,7 @@ class MixedTabularVAE(nn.Module):#master architecture tying the probabilistic pi
         mu,logvar= self.encoder(x)
         z= self.reparameterize(mu, logvar)
         recon_x=self.decoder(z)
-        return recon_x, z
+        return recon_x, z, mu, logvar
 
     @torch.no_grad()
     def generate(self, num_samples: int, device: str='cpu') -> torch.Tensor:

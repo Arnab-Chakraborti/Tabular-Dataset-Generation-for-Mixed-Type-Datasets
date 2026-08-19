@@ -1,33 +1,47 @@
-vae_training:
-  MMD Weight: 250.0
-  VAE epochs: 250
-  batch_size: 256
-  latent_dim: 64
-  dropout: 0.1
-  lr: 0.0008
-architecture:
-  Encoder_dims:
-  - 512
-  - 256
-  - 128
-  Decoder_dims:
-  - 128
-  - 256
-  - 512
-  hidden_dims:
-  - 512
-  - 256
-  diffusion_hidden_dims:
-  - 512
-  - 256
-  time_embedding_dim: 128
-  activation: SiLU
-  use_layernorm: true
+dataset:
+    name: adult
+    url: https://archive.ics.uci.edu/static/public/2/adult.zip
+vae:
+    epochs: 1000
+    learning_rate: 0.001
+    batch_size: 256
+    dropout: 0.0
+    activation: LeakyReLU
+    layernorm: true
+    latent:
+        mode: custom
+        heuristic: null
+        latent_dim: 256
+        encoder_dims:
+        - 2048
+        - 1024
+        - 512
+        decoder_dims:
+        - 512
+        - 1024
+        - 2048
+    mmd:
+        mode: constant
+        weight: 500.0
 diffusion:
-  prediction_type: noise
-  num_diffusion_steps: 100
-  beta_start: 0.0001
-  beta_end: 0.02
-  schedule: linear
-  diffusion_epochs: 200
-  diffusion_lr: 0.00075
+    epochs: 2000
+    learning_rate: 0.001
+    num_diffusion_steps: 2000
+    context_injection:
+        context_columns:
+        - State-gov
+    architecture:
+        type: standard
+        hidden_dims:
+        - 512
+        - 512
+        - 256
+        dropout: 0.1
+    time_conditioning:
+        embedding: sinusoidal
+        method: film
+        embedding_dim: 128
+    noise_schedule:
+        type: linear
+        beta_start: 0.0001
+        beta_end: 0.02

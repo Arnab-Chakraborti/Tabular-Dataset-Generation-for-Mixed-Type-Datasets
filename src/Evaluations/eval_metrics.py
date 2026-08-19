@@ -1,43 +1,84 @@
 import numpy as np
 import pandas as pd
+import scipy.stats as ss
 from scipy.stats import ks_2samp, spearmanr
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
 
 
-def compute_cramers_v(x: pd.Series, y: pd.Series) -> float:
-    """
-    Computes Bias-Corrected Cramér's V for two categorical columns.
-    """
-    confusion_matrix = pd.crosstab(x, y).values
-    n = confusion_matrix.sum()
-    if n == 0:
+def compute_cramers_v(x, y):
+    # SAFETY CHECK 1: Drop NaNs to prevent pandas crosstab from returning empty matrices
+    valid_mask = ~x.isna() & ~y.isna()
+    x_valid, y_valid = x[valid_mask], y[valid_mask]
+    
+    if len(x_valid) <= 1:
         return 0.0
         
-    r, k = confusion_matrix.shape
-    if r <= 1 or k <= 1:
+    confusion_matrix = pd.crosstab(x_valid, y_valid)
+    
+    # specifically prevents the "observed has size 0" crash
+    if confusion_matrix.size == 0 or confusion_matrix.shape[0] < 2 or confusion_matrix.shape[1] < 2:
         return 0.0
-
-    # Calculate standard Chi-Square statistic
-    # Using a manual calculation to maintain stability with small/empty categories
-    expected = (confusion_matrix.sum(axis=1, keepdims=True) * confusion_matrix.sum(axis=0, keepdims=True)) / n
-    # Avoid division by zero for unpopulated combinations
-    with np.errstate(divide='ignore', invalid='ignore'):
-        chi2 = np.nansum((confusion_matrix - expected) ** 2 / expected)
-
+        
+    n = confusion_matrix.sum().sum()
+    if n <= 1:
+        return 0.0
+        
+    chi2 = ss.chi2_contingency(confusion_matrix)[0]
     phi2 = chi2 / n
+    r, k = confusion_matrix.shape
     
-    # Apply bias correction formulas
-    phi2_corrected = max(0.0, phi2 - ((k - 1) * (r - 1)) / (n - 1))
-    r_corrected = r - ((r - 1) ** 2) / (n - 1)
-    k_corrected = k - ((k - 1) ** 2) / (n - 1)
+    phi2corr = max(0, phi2 - ((k-1)*(r-1))/(n-1))
+    rcorr = r - ((r-1)**2)/(n-1)
+    kcorr = k - ((k-1)**2)/(n-1)
+    denom = min((kcorr-1), (rcorr-1))
     
-    denominator = min(k_corrected - 1, r_corrected - 1)
-    if denominator <= 0:
-        return 0.0
-        
-    return float(np.sqrt(phi2_corrected / denominator))
+    return np.sqrt(phi2corr / denom) if denom > 0 else 0.0
 
+def compute_mean_vector_mse(real_df: pd.DataFrame, synthetic_df: pd.DataFrame, drop_cols: list = None) -> float:
+    """
+    Calculates the Mean Squared Error (MSE) between the mean vectors of the 
+    real and synthetic datasets, after dropping specified columns.
+    
+    Parameters:
+    -----------
+    real_df : pd.DataFrame
+        The original baseline dataset.
+    synthetic_df : pd.DataFrame
+        The generated synthetic dataset.
+    drop_cols : list, default=None
+        A list of column names (e.g., categorical/context columns) to exclude 
+        from the calculation.
+        
+    Returns:
+    --------
+    float
+        The Mean Squared Error of the dataset centroids.
+    """
+    if drop_cols is None:
+        drop_cols = []
+        
+    cols_to_drop_real = [c for c in drop_cols if c in real_df.columns]
+    cols_to_drop_synth = [c for c in drop_cols if c in synthetic_df.columns]
+    
+    df_r = real_df.drop(columns=cols_to_drop_real)
+    df_s = synthetic_df.drop(columns=cols_to_drop_synth)
+    
+    num_cols_r = df_r.select_dtypes(include=[np.number]).columns.tolist()
+    num_cols_s = df_s.select_dtypes(include=[np.number]).columns.tolist()
+    
+    common_cols = list(set(num_cols_r).intersection(set(num_cols_s)))
+    
+    # Failsafe if dropping columns removes all valid numerical data
+    if not common_cols:
+        return 0.0 
+        
+    mean_vector_real = df_r[common_cols].mean(skipna=True)
+    mean_vector_synth = df_s[common_cols].mean(skipna=True)
+    
+    mse = np.mean((mean_vector_real - mean_vector_synth) ** 2)
+    
+    return float(mse)
 
 def evaluate_generator_performance(real_df: pd.DataFrame, synthetic_df: pd.DataFrame, k: int = 5) -> dict:
     """
@@ -73,7 +114,17 @@ def evaluate_generator_performance(real_df: pd.DataFrame, synthetic_df: pd.DataF
     
     # Numerical Columns: Two-Sample Kolmogorov-Smirnov Distance
     for col in num_cols:
-        d_ks, _ = ks_2samp(df_r[col].dropna(), df_s[col].dropna())
+        real = df_r[col].dropna()
+        synth = df_s[col].dropna()
+
+    # Handle completely empty columns
+        if len(real) == 0 or len(synth) == 0:
+            d_ks = 1.0
+        elif len(real)==0 and len(synth)==0:
+            d_ks= 0.0
+        else:
+            d_ks, _ = ks_2samp(real, synth)
+
         shape_distances.append(d_ks)
         
     # Categorical Columns: Total Variation Distance (TVD)
@@ -173,7 +224,7 @@ def evaluate_generator_performance(real_df: pd.DataFrame, synthetic_df: pd.DataF
     distances_synth, _ = nn_synth.kneighbors(X_s_space)
     radii_synth = distances_synth[:, -1]
     
-    # Calculate α-Precision
+    # Calculate alpha
     dist_s_to_r, indices_closest_real = nn_real.kneighbors(X_s_space, n_neighbors=1)
     closest_real_radii = radii_real[indices_closest_real.squeeze()]
     # Force arrays to match sizing context if squeeze reduces dimensions to scalar
@@ -181,17 +232,20 @@ def evaluate_generator_performance(real_df: pd.DataFrame, synthetic_df: pd.DataF
         closest_real_radii = np.array([closest_real_radii])
     alpha_precision_pct = np.mean(dist_s_to_r.squeeze() <= closest_real_radii) * 100.0
     
-    # Calculate β-Recall 
+    # Calculate beta
     dist_r_to_s, indices_closest_synth = nn_synth.kneighbors(X_r_space, n_neighbors=1)
     closest_synth_radii = radii_synth[indices_closest_synth.squeeze()]
     if np.isscalar(closest_synth_radii):
         closest_synth_radii = np.array([closest_synth_radii])
     beta_recall_pct = np.mean(dist_r_to_s.squeeze() <= closest_synth_radii) * 100.0
 
+    # Calculate MSE
+    mse= compute_mean_vector_mse(real_df,synthetic_df,['year','month'])
 
     return {
         "shape_error_pct": float(shape_error_pct),      
         "trend_error_pct": float(trend_error_pct),     
         "alpha_precision_pct": float(alpha_precision_pct),  
-        "beta_recall_pct": float(beta_recall_pct)
+        "beta_recall_pct": float(beta_recall_pct),
+        "mse_pct": float(mse)
     }    

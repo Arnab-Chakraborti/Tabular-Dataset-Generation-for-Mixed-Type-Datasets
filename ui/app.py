@@ -2,6 +2,7 @@ import streamlit as st
 import yaml
 import ast
 import os
+import sys
 
 # Define the path to your config file
 CONFIG_PATH = "../configs/default_params.yaml"
@@ -11,6 +12,16 @@ st.set_page_config(page_title="Tabular Generation Config", layout="wide")
 st.title("Tabular Model Hyperparameter UI")
 st.markdown("Adjust the parameters below. Clicking the button will update your YAML configuration.")
 
+DATASET_MAP = {
+    "adult": "https://archive.ics.uci.edu/static/public/2/adult.zip",
+    "default": "https://archive.ics.uci.edu/static/public/350/default+of+credit+card+clients.zip",
+    "magic": "https://archive.ics.uci.edu/static/public/159/magic+gamma+telescope.zip",
+    "shoppers": "https://archive.ics.uci.edu/static/public/468/online+shoppers+purchasing+intention+dataset.zip",
+    "beijing": "https://archive.ics.uci.edu/static/public/381/beijing+pm2+5+data.zip",
+    "news": "https://archive.ics.uci.edu/static/public/332/online+news+popularity.zip",
+    "diabetes": "https://archive.ics.uci.edu/static/public/296/diabetes+130-us+hospitals+for+years+1999-2008.zip"
+}
+AVAILABLE_DATASETS = list(DATASET_MAP.keys())
 # Helper function to parse list inputs safely
 def parse_list(list_str):
     try:
@@ -21,6 +32,10 @@ def parse_list(list_str):
 # ---------------------------------------------------------
 # UI Layout: Organizing parameters into logical columns/tabs
 # ---------------------------------------------------------
+st.header("Dataset Selection")
+selected_dataset = st.selectbox("Choose the dataset to train on:", options= AVAILABLE_DATASETS)
+st.divider()
+
 col1, col2, col3 = st.columns(3)
 
 with col1:
@@ -62,6 +77,11 @@ if st.button("Save Configuration & Trigger Training", type="primary"):
     
     # Construct the configuration dictionary
     config_data = {
+        "data": {
+            "URL": DATASET_MAP[selected_dataset],
+            "name": selected_dataset
+        },
+        
         "vae_training": {
             "MMD Weight": mmd_weight,
             "VAE epochs": epochs,

@@ -1,0 +1,33 @@
+vae_training:
+  VAE epochs: 1000
+  batch_size: 256
+  latent_dim: 128
+  MMD Weight: 120
+  dropout: 0.0
+  lr: 0.0007
+architecture:
+  Encoder_dims:
+  - 512
+  - 256
+  - 128
+  Decoder_dims:
+  - 128
+  - 256
+  - 512
+  hidden_dims:
+  - 512
+  - 256
+  diffusion_hidden_dims:
+  - 512
+  - 256
+  time_embedding_dim: 128
+  activation: SiLU
+  use_layernorm: true
+diffusion:
+  prediction_type: noise
+  num_diffusion_steps: 100
+  diffusion_lr: 0.0007
+  diffusion_epochs: 1000
+  beta_start: 0.0001
+  beta_end: 0.02
+  schedule: linear
